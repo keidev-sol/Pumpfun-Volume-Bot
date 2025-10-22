@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import fs from 'fs';
+import { BIRDEYE_KEY } from '../constants';
 
 dotenv.config();
 
@@ -137,3 +138,31 @@ export function editJson(newData: Partial<Data>, filename: string = "data.json")
   }
 }
 
+export const getTokenPrice = async(address: string): Promise<number> => {
+  try {
+      const options: RequestInit = {
+          method: 'GET',
+          headers: {
+              'X-API-KEY': BIRDEYE_KEY as string
+          }
+      };
+      // Fetch the token price
+      const response = await fetch(`https://public-api.birdeye.so/defi/price?address=${address}`, options);
+      // Check if the response is ok
+      if (!response.ok) {
+          console.error("Error fetching token price: ", response.statusText);
+          return 0; // Return 0 if the fetch fails
+      }
+      const data = await response.json();
+      // Check for the expected structure and return the price
+      if (data && data.data && typeof data.data.value === 'number') {
+          return data.data.value; // Return the price as a number
+      } else {
+          console.error("Unexpected response structure:", data);
+          return 0; // Return 0 if the structure is not as expected
+      }
+  } catch (error) {
+      console.error("Error fetching token price:", error);
+      return 0; // Return 0 on any other error
+  }
+}

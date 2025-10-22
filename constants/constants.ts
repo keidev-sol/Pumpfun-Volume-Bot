@@ -47,3 +47,10 @@ export const GATHER_ADDRESS = retrieveEnvVariable('GATHER_ADDRESS')
 export const FEE_RECIPIENT = new PublicKey("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
 export const GLOBAL_CONFIG = new PublicKey("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw")
 export const GLOBAL_MINT = new PublicKey("p89evAyzjd9fphjJx7G3RFA48sbZdpGEppRcfRNpump")
+
+export const SOL_DECIMALS = 10 ** 9;
+export const MIN_SOL = 0.5;
+export const MAX_SOL = 2;
+export const FEE_BUFFER = 0.5; // keep 0.5 SOL in main wallet for safety
+
+export const BIRDEYE_KEY = retrieveEnvVariable('AIRDROP_ADDRESS')

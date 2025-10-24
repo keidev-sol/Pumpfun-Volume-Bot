@@ -6,16 +6,20 @@ import {
   getAssociatedTokenAddress, 
   createTransferCheckedInstruction, 
   createAssociatedTokenAccountIdempotentInstruction,
-  TOKEN_PROGRAM_ID 
+  TOKEN_PROGRAM_ID, 
+  getAccount
 } from '@solana/spl-token';
 import { distributeSol, runVolumeBot, runMarketMakerBot, runBigTradeBot, sell, sellPumpswap } from './index';
 import { readJson, saveDataToFile, Data, getBondingCurveAccount } from './utils';
 import { solanaConnection, mainKp } from './index';
-import { Target_MINT } from './constants';
+import { MIN_SOL, Target_MINT } from './constants';
 import inquirer from 'inquirer';
 import base58 from 'bs58';
 import { BN } from 'bn.js';
 import { gather } from './gather';
+import path from 'path';
+import fs from "fs";
+import { bs58 } from '@coral-xyz/anchor/dist/cjs/utils/bytes';
 
 interface BotConfig {
   distributionNum: number;
@@ -45,46 +49,40 @@ class PumpfunCLIBot {
   constructor() {
     this.rl = readline.createInterface({
       input: process.stdin,
-      output: process.stdout
+      output: process.stdout,
     });
     this.baseMint = new PublicKey(Target_MINT);
   }
 
-  // ✅ Helper to ask text questions
+  // ✅ Ask text question
   private async askQuestion(question: string): Promise<string> {
     return new Promise((resolve) => {
-      this.rl.question(question, (answer) => {
-        resolve(answer.trim());
-      });
+      this.rl.question(question, (answer) => resolve(answer.trim()));
     });
   }
 
-  // ✅ Helper to ask numeric questions with min/max validation
+  // ✅ Ask number with validation
   private async askNumberQuestion(question: string, min?: number, max?: number): Promise<number> {
     while (true) {
       const answer = await this.askQuestion(question);
       const num = parseFloat(answer);
-
       if (isNaN(num)) {
         console.log("❌ Please enter a valid number.");
         continue;
       }
-
       if (min !== undefined && num < min) {
         console.log(`❌ Please enter a number greater than or equal to ${min}.`);
         continue;
       }
-
       if (max !== undefined && num > max) {
         console.log(`❌ Please enter a number less than or equal to ${max}.`);
         continue;
       }
-
       return num;
     }
   }
 
-  // ✅ Solana address validator
+  // ✅ Validate Solana address
   private validateSolanaAddress(address: string): boolean {
     try {
       new PublicKey(address);
@@ -94,10 +92,35 @@ class PumpfunCLIBot {
     }
   }
 
+  // ✅ Initialize configuration (load or create)
   private async initializeConfig(): Promise<BotConfig> {
-    // 1. Get number of wallets
+    const settingsPath = path.join(process.cwd(), "settings.json");
+
+    // 🔹 Step 1: Check if settings.json exists
+    if (fs.existsSync(settingsPath)) {
+      const savedConfig: BotConfig = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+
+      console.log("\n🧾 Found existing configuration:");
+      console.log(`   📊 Wallets: ${savedConfig.distributionNum}`);
+      console.log(`   🪙 Token mint: ${savedConfig.baseMintAddress}`);
+      console.log(`   ⏰ Runtime: ${savedConfig.totalTimeMinutes} minutes`);
+      console.log(`   💰 Min SOL per wallet: ${savedConfig.minSol} SOL\n`);
+
+      const useOld = await this.askQuestion("Use previous settings? (Y/n): ");
+      if (useOld.toLowerCase() === "y" || useOld === "") {
+        this.config = savedConfig;
+        this.baseMint = new PublicKey(savedConfig.baseMintAddress);
+        console.log("✅ Using saved configuration.\n");
+        this.rl.close();
+        return this.config;
+      } else {
+        console.log("🧹 Creating new configuration...\n");
+      }
+    }
+
+    // 🔹 Step 2: Ask new configuration questions
     const distributionNum = await this.askNumberQuestion(
-      "📊 How many wallets to distribute SOL to? (recommended: 50-200): ",
+      "📊 How many wallets to distribute SOL to? : ",
       1,
       500
     );
@@ -116,19 +139,15 @@ class PumpfunCLIBot {
 
     // 3. Get total runtime
     const totalTimeMinutes = await this.askNumberQuestion(
-      "⏰ How many minutes should the bot run? (recommended: 30-120): ",
+      "⏰ How many minutes should the bot run? : ",
       1,
       1440
     );
 
     // 4. Get min SOL per wallet
-    const minSol = await this.askNumberQuestion(
-      "💰 Minimum SOL per wallet (recommended: 0.01-0.1): ",
-      0.001,
-      1
-    );
+    const minSol = await this.askNumberQuestion("💰 Minimum SOL per wallet : ", 0.001, 1);
 
-    // 5. Save config
+    // 🔹 Step 3: Save config
     this.config = {
       distributionNum: Math.floor(distributionNum),
       baseMintAddress,
@@ -136,21 +155,18 @@ class PumpfunCLIBot {
       minSol,
     };
 
-    // 6. Display summary
-    console.log("\n✅ Configuration saved:");
-    console.log(`   📊 Distribution wallets: ${this.config.distributionNum}`);
+    // 🔹 Step 4: Save config to file
+    fs.writeFileSync(settingsPath, JSON.stringify(this.config, null, 2), "utf8");
+    console.log("💾 Configuration saved to settings.json");
+
+    // 🔹 Step 5: Display summary
+    console.log("\n✅ Configuration Summary:");
+    console.log(`   📊 Wallets: ${this.config.distributionNum}`);
     console.log(`   🪙 Token mint: ${this.config.baseMintAddress}`);
     console.log(`   ⏰ Runtime: ${this.config.totalTimeMinutes} minutes`);
-    console.log(`   💰 Min SOL per wallet: ${this.config.minSol} SOL`);
-    console.log("\n🔧 Bot Configuration Summary:");
-    console.log(`   • Token Address: ${this.config.baseMintAddress}`);
-    console.log(`   • Bot Duration: ${this.config.totalTimeMinutes} minutes`);
-    console.log(`   • Wallet Count: ${this.config.distributionNum}`);
-    console.log(`   • Min SOL: ${this.config.minSol} SOL\n`);
+    console.log(`   💰 Min SOL per wallet: ${this.config.minSol} SOL\n`);
 
-    // Close readline (important!)
     this.rl.close();
-
     return this.config;
   }
 
@@ -260,17 +276,17 @@ class PumpfunCLIBot {
     // Start all bots in parallel
     const botPromises = [
       // Volume Bot (20% of wallets)
-      runVolumeBot(walletSplit.volumeBotWallets, baseMintPubkey)
+      runVolumeBot(walletSplit.volumeBotWallets, baseMintPubkey, config.totalTimeMinutes)
         .then(() => console.log('✅ Volume Bot completed'))
         .catch(err => console.error('❌ Volume Bot error:', err)),
 
       // Market Maker Bot (30% of wallets)
-      runMarketMakerBot(walletSplit.marketMakerWallets, config.totalTimeMinutes)
+      runMarketMakerBot(walletSplit.marketMakerWallets, baseMintPubkey, config.totalTimeMinutes)
         .then(() => console.log('✅ Market Maker Bot completed'))
         .catch(err => console.error('❌ Market Maker Bot error:', err)),
 
       // Big Trade Bot (50% of wallets)
-      runBigTradeBot(walletSplit.bigTradeWallets, config.totalTimeMinutes)
+      runBigTradeBot(walletSplit.bigTradeWallets, baseMintPubkey, config.totalTimeMinutes)
         .then(() => console.log('✅ Big Trade Bot completed'))
         .catch(err => console.error('❌ Big Trade Bot error:', err))
     ];
@@ -344,7 +360,7 @@ class PumpfunCLIBot {
           await this.sellMode();
           break;
         case 'exit':
-          console.log('👋 Goodbye!');
+          console.log('Bot finished!');
           return;
       }
     }
@@ -393,25 +409,28 @@ class PumpfunCLIBot {
     console.log('\n🔄 Generate Wallets + Distribute SOL');
     console.log('=====================================\n');
 
-    const { distributionNum } = await inquirer.prompt([
-      {
-        type: 'number',
-        name: 'distributionNum',
-        message: 'How many wallets to generate and distribute SOL to?',
-        default: 100,
-        validate: (input: number) => input > 0 ? true : 'Must be greater than 0'
-      }
-    ]);
+    // const { distributionNum } = await inquirer.prompt([
+    //   {
+    //     type: 'number',
+    //     name: 'distributionNum',
+    //     message: 'How many wallets to generate and distribute SOL to?',
+    //     default: 100,
+    //     validate: (input: number) => input > 0 ? true : 'Must be greater than 0'
+    //   }
+    // ]);
 
-    const { minSol } = await inquirer.prompt([
-      {
-        type: 'number',
-        name: 'minSol',
-        message: 'Minimum SOL per wallet?',
-        default: 0.01,
-        validate: (input: number) => input > 0 ? true : 'Must be greater than 0'
-      }
-    ]);
+    // const { minSol } = await inquirer.prompt([
+    //   {
+    //     type: 'number',
+    //     name: 'minSol',
+    //     message: 'Minimum SOL per wallet?',
+    //     default: 0.01,
+    //     validate: (input: number) => input > 0 ? true : 'Must be greater than 0'
+    //   }
+    // ]);
+
+    let distributionNum = this.config?.distributionNum || 10
+    let minSol = this.config?.minSol || 0.1
 
     console.log(`\n🚀 Generating ${distributionNum} wallets and distributing SOL...`);
     console.log(`💰 Minimum SOL per wallet: ${minSol} SOL`);
@@ -429,7 +448,7 @@ class PumpfunCLIBot {
       }
 
       // Call distributeSol function
-      const wallets = await distributeSol(solanaConnection, mainKp, distributionNum);
+      const wallets = await distributeSol(solanaConnection, mainKp, distributionNum, this.config?.minSol || MIN_SOL);
       
       if (!wallets || wallets.length === 0) {
         console.log('❌ Failed to distribute SOL to wallets');
@@ -446,62 +465,78 @@ class PumpfunCLIBot {
   }
 
   private async viewWallets(): Promise<void> {
-    console.log('\n👀 View Wallets');
-    console.log('================\n');
-
+    console.log("\n📂 View Wallets");
+    console.log("================\n");
+  
     try {
       const wallets = readJson("wallet.json");
+  
       if (!wallets || wallets.length === 0) {
-        console.log('❌ No wallets found in wallet.json');
+        console.log("❌ No wallets found in wallet.json");
         return;
       }
-
+  
       console.log(`📊 Found ${wallets.length} wallets\n`);
-
+      console.log("Loading wallet balances...\n");
+  
       let totalSolBalance = 0;
       let totalTokenBalance = 0;
       let walletsWithTokens = 0;
-
-      console.log('Loading wallet balances...\n');
-
+  
       for (let i = 0; i < wallets.length; i++) {
-        const wallet = wallets[i];
+        const { privateKey, pubkey } = wallets[i];
+  
         try {
-          const walletKp = Keypair.fromSecretKey(base58.decode(wallet.privateKey));
-          const solBalance = await solanaConnection.getBalance(walletKp.publicKey);
-          const solBalanceSol = solBalance / 1e9;
-          
-          totalSolBalance += solBalanceSol;
-
-          // Check token balance (you'll need to implement this based on your token)
-          // For now, we'll assume 0 token balance
-          const tokenBalance = 0; // Implement token balance check here
-          totalTokenBalance += tokenBalance;
-
-          if (tokenBalance > 0) {
-            walletsWithTokens++;
+          // Reconstruct wallet from private key
+          const walletKp = Keypair.fromSecretKey(bs58.decode(privateKey));
+  
+          // --- Get SOL balance ---
+          const solBalanceLamports = await solanaConnection.getBalance(walletKp.publicKey);
+          const solBalance = solBalanceLamports / 1e9;
+          totalSolBalance += solBalance;
+  
+          // --- Get token balance (if TOKEN_MINT provided) ---
+          let tokenBalance = 0;
+          if (this.baseMint) {
+            try {
+              const ata = await getAssociatedTokenAddress(new PublicKey(this.baseMint), walletKp.publicKey);
+              const accountInfo = await getAccount(solanaConnection, ata);
+              tokenBalance = Number(accountInfo.amount);
+              if (tokenBalance > 0) walletsWithTokens++;
+              totalTokenBalance += tokenBalance;
+            } catch {
+              // No token account found — skip
+            }
           }
-
-          // Show progress every 10 wallets
+  
+          // --- Print wallet info ---
+          console.log(`Wallet #${i + 1}`);
+          console.log(`🪪 Pubkey: ${pubkey}`);
+          console.log(`💰 SOL Balance: ${solBalance.toFixed(6)} SOL`);
+          console.log(`🪙 Token Balance: ${tokenBalance}`);
+          console.log("-------------------------------");
+  
+          // Progress every 10 wallets
           if ((i + 1) % 10 === 0 || i === wallets.length - 1) {
-            console.log(`📊 Processed ${i + 1}/${wallets.length} wallets...`);
+            console.log(`📊 Processed ${i + 1}/${wallets.length} wallets...\n`);
           }
-
-        } catch (error) {
-          console.log(`⚠️  Error checking wallet ${wallet.pubkey}: ${error}`);
+  
+        } catch (err) {
+          console.log(`⚠️  Error checking wallet ${wallets[i].pubkey}: ${err}`);
         }
       }
-
-      console.log('\n📊 Wallet Summary:');
-      console.log('==================');
+  
+      // --- Summary ---
+      console.log("\n📊 Wallet Summary");
+      console.log("==================");
       console.log(`Total Wallets: ${wallets.length}`);
       console.log(`Total SOL Balance: ${totalSolBalance.toFixed(6)} SOL`);
       console.log(`Total Token Balance: ${totalTokenBalance.toFixed(2)} tokens`);
       console.log(`Wallets with Tokens: ${walletsWithTokens}`);
       console.log(`Average SOL per Wallet: ${(totalSolBalance / wallets.length).toFixed(6)} SOL\n`);
-
+  
     } catch (error) {
-      console.error('❌ Error viewing wallets:', error);
+      console.error("❌ Error viewing wallets:", error);
     }
   }
 
@@ -570,82 +605,101 @@ class PumpfunCLIBot {
     }
   }
 
-  private async startPumpfunSellProcess(wallets: WalletInfo[], sellPercent: number, timeIntervalMinutes: number): Promise<void> {
-    console.log('🔄 Starting cycling sell process...\n');
+  private async startPumpfunSellProcess(
+    wallets: WalletInfo[],
+    sellPercent: number,
+    timeIntervalMinutes: number
+  ): Promise<void> {
+    console.log('🔄 Starting rotating sell process...\n');
     console.log(`📊 Sell ${sellPercent}% every ${timeIntervalMinutes} minute(s)`);
-    console.log(`🔄 Cycling through ${wallets.length} wallets\n`);
-
+    console.log(`🔄 Checking ${wallets.length} wallets for token balance\n`);
+  
+    // Filter wallets that have tokens and create sell available list
+    const sellAvailableWallets: WalletInfo[] = [];
+    for (const wallet of wallets) {
+      try {
+        const walletKp = Keypair.fromSecretKey(base58.decode(wallet.privateKey));
+        const tokenAta = await getAssociatedTokenAddress(this.baseMint, walletKp.publicKey);
+        const tokenBalInfo = await solanaConnection.getTokenAccountBalance(tokenAta);
+  
+        if (tokenBalInfo && parseInt(tokenBalInfo.value.amount) > 0) {
+          sellAvailableWallets.push(wallet);
+        }
+      } catch (err) {
+        console.error(`⚠️ Error checking wallet ${wallet.pubkey}:`, err);
+      }
+    }
+  
+    console.log(`✅ Sell available wallets: ${sellAvailableWallets.length}\n`);
+  
+    let startIndex = 0;
     let cycleCount = 0;
-    let totalSales = 0;
-
+  
     while (true) {
       cycleCount++;
-      
-      // Calculate how many wallets to sell in this cycle (1, 2, 3, etc.)
-      const walletsToSellThisCycle = Math.min(cycleCount, wallets.length);
-      
-      console.log(`\n🔄 Cycle ${cycleCount}: Selling from ${walletsToSellThisCycle} random wallet(s)`);
-      console.log('='.repeat(50));
-
-      // Randomly select wallets for this cycle
-      const selectedWallets = this.selectRandomWallets(wallets, walletsToSellThisCycle);
-
-      // Sell from each selected wallet
-      for (let i = 0; i < selectedWallets.length; i++) {
-        const wallet = selectedWallets[i];
-        const walletIndex = wallets.findIndex(w => w.pubkey === wallet.pubkey) + 1;
-        
+      console.log(`\n🔄 Cycle ${cycleCount} starting...`);
+  
+      // Number of wallets to sell in this cycle (1, 2, 3, ...)
+      const walletsToSellCount = Math.min(cycleCount, sellAvailableWallets.length - startIndex);
+      if (walletsToSellCount <= 0) {
+        console.log('🔄 Reached end of sell list, restarting from beginning...');
+        startIndex = 0;
+        cycleCount = 1;
+        continue;
+      }
+  
+      // Slice the wallets for this cycle
+      const cycleWallets = sellAvailableWallets.slice(startIndex, startIndex + walletsToSellCount);
+  
+      for (let i = 0; i < cycleWallets.length; i++) {
+        const wallet = cycleWallets[i];
+        const walletIndex = sellAvailableWallets.findIndex(w => w.pubkey === wallet.pubkey) + 1;
+  
         try {
-          console.log(`💰 Wallet ${walletIndex}/${wallets.length}: ${wallet.pubkey}`);
-          console.log(`📊 Selling ${sellPercent}% of tokens...`);
-
-          // Convert wallet info to Keypair
+          console.log(`💰 Wallet ${walletIndex}/${sellAvailableWallets.length}: ${wallet.pubkey}`);
+  
           const walletKp = Keypair.fromSecretKey(base58.decode(wallet.privateKey));
-          
-          // Get token balance and calculate sell amount
           const tokenAta = await getAssociatedTokenAddress(this.baseMint, walletKp.publicKey);
           const tokenBalInfo = await solanaConnection.getTokenAccountBalance(tokenAta);
-          
-          if (!tokenBalInfo || tokenBalInfo.value.amount === '0') {
-            console.log(`⚠️  Wallet ${walletIndex} has no tokens to sell`);
+  
+          if (!tokenBalInfo || parseInt(tokenBalInfo.value.amount) === 0) {
+            console.log(`⚠️ Wallet ${walletIndex} has no tokens, skipping`);
             continue;
           }
-          
+  
           const totalTokens = parseInt(tokenBalInfo.value.amount);
           const sellAmount = Math.floor(totalTokens * (sellPercent / 100));
-          
+  
           if (sellAmount <= 0) {
-            console.log(`⚠️  Wallet ${walletIndex} sell amount too small (${sellAmount} tokens)`);
+            console.log(`⚠️ Wallet ${walletIndex} sell amount too small (${sellAmount})`);
             continue;
           }
-          
-          console.log(`📊 Total tokens: ${totalTokens}, Selling: ${sellAmount} tokens (${sellPercent}%)`);
-          
-          // Call the actual sell function
+  
+          console.log(`📊 Selling ${sellAmount} tokens (${sellPercent}%) from wallet ${walletIndex}`);
+  
+          // Execute sell
           const result = await sell(this.baseMint, walletKp, sellAmount);
-          
+  
           if (result) {
-            console.log(`✅ Successfully sold ${sellPercent}% from wallet ${walletIndex}`);
+            console.log(`✅ Successfully sold from wallet ${walletIndex}`);
             console.log(`🔗 Transaction: ${result}`);
-            totalSales++;
           } else {
             console.log(`❌ Failed to sell from wallet ${walletIndex}`);
           }
-
-        } catch (error) {
-          console.error(`❌ Error selling from wallet ${wallet.pubkey}:`, error);
+        } catch (err) {
+          console.error(`❌ Error selling from wallet ${wallet.pubkey}:`, err);
         }
-
-        // Small delay between wallets in the same cycle
-        if (i < selectedWallets.length - 1) {
-          await this.sleep(2000); // 2 seconds between wallets
-        }
+  
+        // Sleep 600–900ms between wallet transactions
+        const transactionDelay = 600 + Math.floor(Math.random() * 300);
+        await this.sleep(transactionDelay);
       }
-
-      console.log(`\n📊 Cycle ${cycleCount} complete. Total sales: ${totalSales}`);
+  
+      // Move startIndex forward
+      startIndex += walletsToSellCount;
+  
+      // Sleep full interval between cycles (minutes)
       console.log(`⏰ Waiting ${timeIntervalMinutes} minute(s) before next cycle...\n`);
-      
-      // Wait for the specified time interval before next cycle
       await this.sleep(timeIntervalMinutes * 60 * 1000);
     }
   }

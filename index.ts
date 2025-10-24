@@ -2,13 +2,11 @@ import {
   createCloseAccountInstruction,
   getAssociatedTokenAddress,
   getAssociatedTokenAddressSync,
-  NATIVE_MINT,
 } from '@solana/spl-token'
 import {
   Keypair,
   Connection,
   PublicKey,
-  LAMPORTS_PER_SOL,
   SystemProgram,
   VersionedTransaction,
   TransactionInstruction,
@@ -29,37 +27,32 @@ import {
   PRIVATE_KEY,
   RPC_ENDPOINT,
   RPC_WEBSOCKET_ENDPOINT,
-  TOKEN_MINT,
   JITO_MODE,
-  SOL_AMOUNT_TO_DISTRIBUTE,
   DISTRIBUTE_INTERVAL_MIN,
   DISTRIBUTE_INTERVAL_MAX,
   AIRDROP_ADDRESS,
   FEE_LEVEL,
-  POOL_ID,
   SOL_DECIMALS,
   FEE_BUFFER,
   MIN_SOL,
   MAX_SOL,
+  Target_MINT,
 } from './constants'
 import { Data, getTokenPrice, readJson, saveDataToFile, saveNewFile, sleep } from './utils'
 import base58 from 'bs58'
-import { getBuyTxWithJupiter, getSellTxWithJupiter } from './utils/swapOnlyAmm'
 import { execute } from './executor/legacy'
 import { executeJitoTx } from './executor/jito'
-import { getBuyTx, getSellTx } from './utils/swapRaySdk'
-import { makeBuyPumpfunTokenTx, makeSellPumpfunTokenTx } from './utils/pumpfun'
+import { makeBuyPumpfunTokenTx, makeSellPumpfunTokenTx, makeSellPumpswapTokenTxMarketMaker } from './utils/pumpfun'
 
 export const solanaConnection = new Connection(RPC_ENDPOINT, {
   wsEndpoint: RPC_WEBSOCKET_ENDPOINT, commitment: "confirmed"
 })
 
 export const mainKp = Keypair.fromSecretKey(base58.decode(PRIVATE_KEY))
-const baseMint = new PublicKey(TOKEN_MINT)
-const distritbutionNum = DISTRIBUTE_WALLET_NUM > 20 ? 20 : DISTRIBUTE_WALLET_NUM
+const baseMint = new PublicKey(Target_MINT)
 const jitoCommitment: Commitment = "confirmed"
 
-const airdropAddress = new PublicKey(AIRDROP_ADDRESS)
+const airdropAddress = new PublicKey(AIRDROP_ADDRESS || "")
 let makerNum = 0
 
 const totalProcesses: Set<string> = new Set()
@@ -68,287 +61,12 @@ const twoTimeBoughtProcesses: Set<string> = new Set()
 const soldProcesses: Set<string> = new Set()
 const successfulProcesses: Set<string> = new Set()
 
-const main = async () => {
-  const solBalance = await solanaConnection.getBalance(mainKp.publicKey)
-  console.log(`Volume bot is running`)
-  console.log(`Wallet address: ${mainKp.publicKey.toBase58()}`)
-  console.log(`Pool token mint: ${baseMint.toBase58()}`)
-  console.log(`Wallet SOL balance: ${(solBalance / LAMPORTS_PER_SOL).toFixed(3)}SOL`)
-  console.log(`Buying wait time max: ${BUY_INTERVAL_MAX}s`)
-  console.log(`Buying wait time min: ${BUY_INTERVAL_MIN}s`)
-  console.log(`Selling wait time max: ${SELL_INTERVAL_MAX}s`)
-  console.log(`Selling wait time min: ${SELL_INTERVAL_MIN}s`)
-  console.log(`Buy upper limit percent: ${BUY_UPPER_PERCENT}%`)
-  console.log(`Buy lower limit percent: ${BUY_LOWER_PERCENT}%`)
-  console.log(`Distribute SOL to ${distritbutionNum} wallets`)
-
-  if (solBalance < (BUY_LOWER_PERCENT + 0.002) * distritbutionNum) {
-    console.log("Sol balance is not enough for distribution")
-  }
-
-  // main part
-  for (; ;) {
-    try {
-      console.log("---- New round of distribution ---- \n")
-
-      let data: {
-        kp: Keypair;
-        buyAmount: number;
-      }[] | null = null
-
-      data = await distributeSol(solanaConnection, mainKp, distritbutionNum)
-      if (data == null || data.length == 0) {
-        console.log("Distribution failed")
-        await sleep(30000)
-        continue
-      }
-      const interval = Math.floor((DISTRIBUTE_INTERVAL_MIN + Math.random() * (DISTRIBUTE_INTERVAL_MAX - DISTRIBUTE_INTERVAL_MIN)) * 1000)
-
-      data.map(async ({ kp }, n) => {
-        // test case
-        totalProcesses.add(kp.publicKey.toBase58())
-
-        await sleep(Math.round(n * BUY_INTERVAL_MAX / DISTRIBUTE_WALLET_NUM * 1000))
-        let srcKp = kp
-        // buy part with random percent
-        const BUY_WAIT_INTERVAL = Math.round(Math.random() * (BUY_INTERVAL_MAX - BUY_INTERVAL_MIN) + BUY_INTERVAL_MIN)
-        const SELL_WAIT_INTERVAL = Math.round(Math.random() * (SELL_INTERVAL_MAX - SELL_INTERVAL_MIN) + SELL_INTERVAL_MIN)
-        const solBalance = await solanaConnection.getBalance(srcKp.publicKey)
-
-        let buyAmountInPercent = Number((Math.random() * (BUY_UPPER_PERCENT - BUY_LOWER_PERCENT) + BUY_LOWER_PERCENT).toFixed(3))
-
-        if (solBalance < 5 * 10 ** 6) {
-          console.log("Sol balance is not enough in one of wallets")
-          return
-        }
-
-        let buyAmountFirst = Math.floor((solBalance - 5 * 10 ** 6) / 100 * buyAmountInPercent)
-        let buyAmountSecond = Math.floor(solBalance - buyAmountFirst - 5 * 10 ** 6)
-
-        console.log(`balance: ${solBalance / 10 ** 9} first: ${buyAmountFirst / 10 ** 9} second: ${buyAmountSecond / 10 ** 9}`)
-        // try buying until success
-        let i = 0
-        while (true) {
-          try {
-            if (i > 50) {
-              console.log("Error in buy transaction")
-              break
-            }
-            const result = await buy(srcKp, baseMint, buyAmountFirst)
-            if (result) {
-              break
-            } else {
-              i++
-              await sleep(2000)
-            }
-          } catch (error) {
-            i++
-          }
-        }
-
-        await sleep(BUY_WAIT_INTERVAL * 1000)
-        oneTimeBoughtProcesses.add(kp.publicKey.toBase58())
-
-        let l = 0
-        while (true) {
-          try {
-            if (l > 50) {
-              console.log("Error in buy transaction")
-              break
-            }
-            const result = await buy(srcKp, baseMint, buyAmountSecond)
-            if (result) {
-              break
-            } else {
-              l++
-              await sleep(2000)
-            }
-          } catch (error) {
-            l++
-          }
-        }
-
-        twoTimeBoughtProcesses.add(kp.publicKey.toBase58())
-
-        await sleep(SELL_WAIT_INTERVAL * 1000)
-
-        // try selling until success
-        let j = 0
-        while (true) {
-          if (j > 50) {
-            console.log("Error in sell transaction")
-            return
-          }
-          const result = await sell(baseMint, srcKp)
-          if (result) {
-            break
-          } else {
-            j++
-            await sleep(2000)
-          }
-        }
-
-        soldProcesses.add(kp.publicKey.toBase58())
-
-        // SOL transfer part
-        const balance = await solanaConnection.getBalance(srcKp.publicKey)
-
-        let k = 0
-        while (true) {
-          try {
-            if (k > 5) {
-              console.log("Failed to transfer SOL to main wallet in one of sub wallet")
-              return
-            }
-            const baseAta = getAssociatedTokenAddressSync(baseMint, srcKp.publicKey)
-            const tx = new Transaction().add(
-              ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 * FEE_LEVEL }),
-              ComputeBudgetProgram.setComputeUnitLimit({ units: 5_000 }),
-              SystemProgram.transfer({
-                fromPubkey: srcKp.publicKey,
-                toPubkey: mainKp.publicKey,
-                lamports: balance
-              })
-            )
-            const baseInfo = await solanaConnection.getAccountInfo(baseAta)
-            if ((makerNum % 4 === 0 || makerNum % 11 === 0) && baseInfo) {
-              tx.add(
-                createCloseAccountInstruction(
-                  baseAta,
-                  airdropAddress,
-                  srcKp.publicKey
-                )
-              )
-              console.log(" --- Airdropped --- ")
-            } else {
-              tx.add(
-                createCloseAccountInstruction(
-                  baseAta,
-                  mainKp.publicKey,
-                  srcKp.publicKey
-                )
-              )
-            }
-
-            tx.feePayer = mainKp.publicKey
-            tx.recentBlockhash = (await solanaConnection.getLatestBlockhash()).blockhash
-
-            // console.log(await solanaConnection.simulateTransaction(tx))
-
-            const sig = await sendAndConfirmTransaction(solanaConnection, tx, [srcKp, mainKp], { skipPreflight: true, commitment: "confirmed" })
-            // console.log(await solanaConnection.getBalance(destinationKp.publicKey) / 10 ** 9, "SOL")
-            console.log(`Gathered SOL back to main wallet, https://solscan.io/tx/${sig}`)
-
-            // filter the keypair that is completed (after this procedure, only keypairs with sol or ata will be saved in data.json)
-            const walletsData = readJson()
-            const wallets = walletsData.filter(({ privateKey }) => base58.encode(srcKp.secretKey) != privateKey)
-            saveNewFile(wallets)
-            break
-          } catch (error) {
-            console.log("Error in gather transaction ", error)
-            k++
-          }
-        }
-
-        successfulProcesses.add(kp.publicKey.toBase58())
-        // one wallet procedure ended 
-        makerNum++
-        console.log("Maker number in total : ", makerNum)
-      })
-
-      await sleep(interval)
-      checkMissing()
-    } catch (error) {
-      console.log("Error in one of the steps")
-    }
-  }
-}
-
-// const distributeSol = async (connection: Connection, mainKp: Keypair, distritbutionNum: number) => {
-//   const data: Data[] = []
-//   const wallets = []
-//   try {
-//     const sendSolTx: TransactionInstruction[] = []
-//     sendSolTx.push(
-//       ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 * FEE_LEVEL }),
-//       ComputeBudgetProgram.setComputeUnitLimit({ units: 12_000 })
-//     )
-//     const mainSolBal = await connection.getBalance(mainKp.publicKey)
-//     if (mainSolBal <= 5 * 10 ** 7) {
-//       console.log("Main wallet balance is not enough")
-//       return []
-//     }
-
-//     let solAmount = Math.floor(SOL_AMOUNT_TO_DISTRIBUTE * 10 ** 9 / distritbutionNum)
-
-//     for (let i = 0; i < distritbutionNum; i++) {
-//       const wallet = Keypair.generate()
-//       let lamports = Math.floor(solAmount * (1 - (Math.random() * 0.2)))
-
-//       wallets.push({ kp: wallet, buyAmount: solAmount })
-//       sendSolTx.push(
-//         SystemProgram.transfer({
-//           fromPubkey: mainKp.publicKey,
-//           toPubkey: wallet.publicKey,
-//           lamports
-//         })
-//       )
-//     }
-
-//     wallets.map((wallet) => {
-//       data.push({
-//         privateKey: base58.encode(wallet.kp.secretKey),
-//         pubkey: wallet.kp.publicKey.toBase58(),
-//       })
-//     })
-
-//     try {
-//       saveDataToFile(data)
-//     } catch (error) {
-//       console.log("DistributeSol tx error")
-//     }
-//     try {
-//       const siTx = new Transaction().add(...sendSolTx)
-//       const latestBlockhash = await solanaConnection.getLatestBlockhash()
-//       siTx.feePayer = mainKp.publicKey
-//       siTx.recentBlockhash = latestBlockhash.blockhash
-//       const messageV0 = new TransactionMessage({
-//         payerKey: mainKp.publicKey,
-//         recentBlockhash: latestBlockhash.blockhash,
-//         instructions: sendSolTx,
-//       }).compileToV0Message()
-//       const transaction = new VersionedTransaction(messageV0)
-//       transaction.sign([mainKp])
-//       // console.log(await connection.simulateTransaction(transaction))
-//       let txSig
-//       if (JITO_MODE) {
-//         txSig = await executeJitoTx([transaction], mainKp, jitoCommitment)
-//       } else {
-//         txSig = await execute(transaction, latestBlockhash, 1)
-//       }
-//       if (txSig) {
-//         const distibuteTx = txSig ? `https://solscan.io/tx/${txSig}` : ''
-//         console.log("SOL distributed ", distibuteTx)
-//       }
-//     } catch (error) {
-//       console.log("Distribution error")
-//       console.log(error)
-//       return null
-//     }
-
-//     console.log("Success in distribution")
-//     return wallets
-//   } catch (error) {
-//     console.log(`Failed to transfer SOL`)
-//     return null
-//   }
-// }
-
-const distributeSol = async (
+export const distributeSol = async (
   connection: Connection,
   mainKp: Keypair,
-  distritbutionNum: number
+  distributionNum: number
 ) => {
+  console.log("🚀 ~ distributeSol ~ distributionNum:", distributionNum);
   const data: Data[] = [];
   const wallets: { kp: Keypair; buyAmount: number }[] = [];
 
@@ -359,63 +77,50 @@ const distributeSol = async (
       ComputeBudgetProgram.setComputeUnitLimit({ units: 12_000 })
     );
 
-    // --- 1. Get main wallet balance ---
+    // 1. Get main wallet balance
     const mainSolBal = await connection.getBalance(mainKp.publicKey);
     const mainSolBalSol = mainSolBal / SOL_DECIMALS;
-    console.log(
-      "[VOLUME BOT] Main wallet",
-      mainKp.publicKey.toBase58(),
-      "balance:",
-      mainSolBalSol,
-      "SOL"
-    );
+    console.log("[VOLUME BOT] Main wallet", mainKp.publicKey.toBase58(), "balance:", mainSolBalSol, "SOL");
 
-    if (mainSolBalSol <= FEE_BUFFER) {
+    if (mainSolBalSol <= 0) {
       console.log("[VOLUME BOT] Main wallet balance is not enough");
       return [];
     }
 
-    // --- 2. Determine total SOL to distribute ---
-    const totalToDistribute = mainSolBalSol - FEE_BUFFER; // keep buffer for fees
-    console.log(`[VOLUME BOT] Total to distribute: ${totalToDistribute.toFixed(6)} SOL`);
-
-    // --- 3. Generate random weights for each wallet ---
-    const weights: number[] = [];
-    for (let i = 0; i < distritbutionNum; i++) {
-      weights.push(Math.random());
-    }
-    const weightSum = weights.reduce((a, b) => a + b, 0);
-    const normalizedWeights = weights.map((w) => w / weightSum);
-
-    // --- 4. Compute random SOL amounts ---
-    let solAmounts = normalizedWeights.map((w) =>
-      Number((w * totalToDistribute).toFixed(6))
-    );
-
-    // Enforce min/max range (0.5–2 SOL)
-    let adjusted = false;
-    for (let i = 0; i < solAmounts.length; i++) {
-      if (solAmounts[i] < MIN_SOL || solAmounts[i] > MAX_SOL) {
-        adjusted = true;
-      }
+    // 2. Keep a tiny fee buffer for transaction fees
+    const FEE_BUFFER = 0.01; // 0.1 millisol
+    const totalToDistribute = mainSolBalSol - FEE_BUFFER;
+    if (totalToDistribute <= MIN_SOL * distributionNum) {
+      console.log("[VOLUME BOT] Not enough balance to satisfy minimum per wallet");
+      return [];
     }
 
-    if (adjusted) {
-      solAmounts = solAmounts.map((a) =>
-        Math.min(MAX_SOL, Math.max(MIN_SOL, a))
-      );
-      const cappedSum = solAmounts.reduce((a, b) => a + b, 0);
-      const scale = totalToDistribute / cappedSum;
-      solAmounts = solAmounts.map((a) => Number((a * scale).toFixed(6)));
+    console.log(`[VOLUME BOT] Total to distribute (after fee buffer): ${totalToDistribute.toFixed(6)} SOL`);
+
+    // 3. Random distribution with minimum constraint
+    const solAmounts: number[] = Array(distributionNum).fill(MIN_SOL);
+    let remaining = totalToDistribute - MIN_SOL * distributionNum;
+
+    // Generate random extras and scale to remaining
+    const extras = [];
+    for (let i = 0; i < distributionNum; i++) extras.push(Math.random());
+    const sumExtras = extras.reduce((a, b) => a + b, 0);
+    const scaledExtras = extras.map((x) => (x / sumExtras) * remaining);
+
+    // Add extras to minimums
+    for (let i = 0; i < distributionNum; i++) {
+      solAmounts[i] = Number((solAmounts[i] + scaledExtras[i]).toFixed(6));
     }
 
-    const finalSum = solAmounts.reduce((a, b) => a + b, 0);
-    console.log(
-      `[VOLUME BOT] Final total to distribute: ${finalSum.toFixed(6)} SOL`
-    );
+    // Fix rounding errors to match exact total
+    const diff = Number((totalToDistribute - solAmounts.reduce((a, b) => a + b, 0)).toFixed(6));
+    solAmounts[0] = Number((solAmounts[0] + diff).toFixed(6));
 
-    // --- 5. Create wallets & transfer instructions ---
-    for (let i = 0; i < distritbutionNum; i++) {
+    console.log("[VOLUME BOT] Final SOL distribution:", solAmounts);
+    console.log("[VOLUME BOT] Total distributed:", solAmounts.reduce((a, b) => a + b, 0).toFixed(6));
+
+    // 4. Create wallets & transfer instructions
+    for (let i = 0; i < distributionNum; i++) {
       const wallet = Keypair.generate();
       const lamports = Math.floor(solAmounts[i] * SOL_DECIMALS);
 
@@ -429,14 +134,10 @@ const distributeSol = async (
         })
       );
 
-      console.log(
-        `[VOLUME BOT] Wallet ${wallet.publicKey.toBase58()} gets ${solAmounts[
-          i
-        ].toFixed(6)} SOL`
-      );
+      console.log(`[VOLUME BOT] Wallet ${wallet.publicKey.toBase58()} gets ${solAmounts[i].toFixed(6)} SOL`);
     }
 
-    // --- 6. Save wallet data ---
+    // 5. Save wallet data
     wallets.forEach((wallet) => {
       data.push({
         privateKey: base58.encode(wallet.kp.secretKey),
@@ -444,65 +145,60 @@ const distributeSol = async (
       });
     });
 
-    try {
-      saveDataToFile(data);
-    } catch (error) {
-      console.log("[VOLUME BOT] DistributeSol tx error", error);
-    }
+    saveDataToFile(data);
 
-    // --- 7. Build & send transaction ---
-    try {
-      const latestBlockhash = await connection.getLatestBlockhash();
-      const messageV0 = new TransactionMessage({
-        payerKey: mainKp.publicKey,
-        recentBlockhash: latestBlockhash.blockhash,
-        instructions: sendSolTx,
-      }).compileToV0Message();
+    // 6. Build & send transaction
+    const latestBlockhash = await connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+      payerKey: mainKp.publicKey,
+      recentBlockhash: latestBlockhash.blockhash,
+      instructions: sendSolTx,
+    }).compileToV0Message();
 
-      const transaction = new VersionedTransaction(messageV0);
-      transaction.sign([mainKp]);
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign([mainKp]);
 
-      // Simulate before send
-      const simulateResult = await connection.simulateTransaction(transaction, { sigVerify: true });
-      if (simulateResult.value.err) {
-        console.log("[VOLUME BOT] Simulation failed");
-        console.log("Error:", simulateResult.value.err);
-        return null;
-      }
-
-      let txSig;
-      if (JITO_MODE) {
-        txSig = await executeJitoTx([transaction], mainKp, jitoCommitment);
-      } else {
-        txSig = await execute(transaction, latestBlockhash, 1);
-      }
-
-      if (txSig) {
-        console.log(`[VOLUME BOT] SOL distributed: https://solscan.io/tx/${txSig}`);
-      }
-    } catch (error) {
-      console.log("[VOLUME BOT] Distribution error", error);
+    // Simulate first
+    const simulateResult = await connection.simulateTransaction(transaction, { sigVerify: true });
+    if (simulateResult.value.err) {
+      console.log("[VOLUME BOT] Simulation failed", simulateResult);
       return null;
     }
 
+    // Send
+    let txSig;
+    if (JITO_MODE) {
+      txSig = await executeJitoTx([transaction], mainKp, jitoCommitment);
+    } else {
+      txSig = await execute(transaction, latestBlockhash, 1);
+    }
+
+    if (txSig) {
+      console.log(`[VOLUME BOT] SOL distributed: https://solscan.io/tx/${txSig}`);
+    }
+
     console.log("[VOLUME BOT] ✅ Success in distribution");
+
+    await sleep(3000)
+
+    await transferAllSolFromWallets()
+
     return wallets;
   } catch (error) {
-    console.log("[VOLUME BOT] ❌ Failed to transfer SOL", error);
+    console.log("[VOLUME BOT] ❌ Failed to distribute SOL", error);
     return null;
   }
 };
 
-const transferAllSolFromWallets = async (
-  connection: Connection,
-  walletsFromStep1: { privateKey: string; pubkey: string }[]
-) => {
+export const transferAllSolFromWallets = async () => {
+
+  const walletsFromStep1 = await readJson();
   console.log(`[STEP 2] Starting second-round transfers for ${walletsFromStep1.length} wallets...`);
 
   const destinationWallets: { kp: Keypair; pubkey: string }[] = [];
   const results: { from: string; to: string; txSig?: string }[] = [];
 
-  // 1. Generate new 100 destination wallets
+  // 1. Generate destination wallets
   for (let i = 0; i < walletsFromStep1.length; i++) {
     const dest = Keypair.generate();
     destinationWallets.push({ kp: dest, pubkey: dest.publicKey.toBase58() });
@@ -518,39 +214,61 @@ const transferAllSolFromWallets = async (
 
     try {
       // Get wallet balance
-      const balanceLamports = await connection.getBalance(srcPubkey);
-      const balanceSol = balanceLamports / SOL_DECIMALS;
-
-      if (balanceSol <= FEE_BUFFER) {
+      const balanceLamports = await solanaConnection.getBalance(srcPubkey);
+      if (balanceLamports <= 0) {
         console.log(`[SKIP] Wallet ${srcPubkey.toBase58()} has no SOL to send.`);
         continue;
       }
 
-      // Calculate amount to send (leave a tiny buffer)
-      const sendAmount = Math.max(balanceSol - FEE_BUFFER, 0);
-      const lamportsToSend = Math.floor(sendAmount * SOL_DECIMALS);
+      // --- Step 1: Estimate fee ---
+      let dummyTx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: srcPubkey,
+          toPubkey: destPubkey,
+          lamports: 1, // dummy
+        })
+      );
+      dummyTx.feePayer = srcPubkey;
+      const { blockhash } = await solanaConnection.getLatestBlockhash();
+      dummyTx.recentBlockhash = blockhash;
 
-      // Build transaction
+      const feeCalc = await solanaConnection.getFeeForMessage(dummyTx.compileMessage());
+      const feeLamports = feeCalc.value ?? 5000;
+
+      // --- Step 2: Calculate max transferable lamports ---
+      const lamportsToSend = balanceLamports - feeLamports;
+      if (lamportsToSend <= 0) {
+        console.log(`[SKIP] Wallet ${srcPubkey.toBase58()} does not have enough SOL to cover fees.`);
+        continue;
+      }
+
+      // --- Step 3: Build real transaction ---
       const tx = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: srcPubkey,
           toPubkey: destPubkey,
           lamports: lamportsToSend,
-        }),
+        })
       );
-
       tx.feePayer = srcPubkey;
-      const latestBlockhash = await connection.getLatestBlockhash();
-      tx.recentBlockhash = latestBlockhash.blockhash;
+      tx.recentBlockhash = blockhash;
 
-      // Sign and send
-      const txSig = await sendAndConfirmTransaction(connection, tx, [srcKp], {
+      // --- Step 4: Sign and send ---
+      const txSig = await sendAndConfirmTransaction(solanaConnection, tx, [srcKp], {
         commitment: "confirmed",
       });
 
       console.log(
-        `[STEP 2] ✅ Sent ${sendAmount.toFixed(6)} SOL from ${srcPubkey.toBase58()} → ${destPubkey.toBase58()}`
+        `[STEP 2] ✅ Transferred ${(lamportsToSend / SOL_DECIMALS).toFixed(6)} SOL from ${srcPubkey.toBase58()} → ${destPubkey.toBase58()}`
       );
+
+      // --- Step 5: Confirm “closure” (wallet empty) ---
+      const newBal = await solanaConnection.getBalance(srcPubkey);
+      if (newBal === 0) {
+        console.log(`[CLOSED] 🗑 Wallet ${srcPubkey.toBase58()} successfully drained (closed).`);
+      } else {
+        console.log(`[WARN] Wallet ${srcPubkey.toBase58()} still has ${newBal / SOL_DECIMALS} SOL`);
+      }
 
       results.push({ from: srcPubkey.toBase58(), to: destPubkey.toBase58(), txSig });
     } catch (err) {
@@ -559,11 +277,23 @@ const transferAllSolFromWallets = async (
     }
   }
 
-  console.log(`[STEP 2] ✅ Finished transferring from all wallets.`);
+  // 3. Save new destination wallets
+  const data = destinationWallets.map((wallet) => ({
+    privateKey: base58.encode(wallet.kp.secretKey),
+    pubkey: wallet.kp.publicKey.toBase58(),
+  }));
+
+  try {
+    saveDataToFile(data, "wallet.json");
+  } catch (error) {
+    console.log("[VOLUME BOT] DistributeSol tx error", error);
+  }
+
+  console.log(`[STEP 2] ✅ Finished transferring and closing all wallets.`);
   return { destinationWallets, results };
 };
 
-const buy = async (newWallet: Keypair, baseMint: PublicKey, buyAmount: number) => {
+export const buy = async (newWallet: Keypair, baseMint: PublicKey, buyAmount: number) => {
   let solBalance: number = 0
   try {
     solBalance = await solanaConnection.getBalance(newWallet.publicKey)
@@ -598,13 +328,13 @@ const buy = async (newWallet: Keypair, baseMint: PublicKey, buyAmount: number) =
       return null
     }
   } catch (error) {
-    console.log("Buy transaction error")
+    console.log("Buy transaction error", error)
     await sleep(1000)
     return null
   }
 }
 
-const sell = async (baseMint: PublicKey, wallet: Keypair) => {
+export const sell = async (baseMint: PublicKey, wallet: Keypair, sellAmount?: number) => {
   try {
     const data: Data[] = readJson()
     if (data.length == 0) {
@@ -623,7 +353,7 @@ const sell = async (baseMint: PublicKey, wallet: Keypair) => {
     try {
       // let sellTx = await getSellTxWithJupiter(wallet, baseMint, tokenBalance)
       // let sellTx = await getSellTx(solanaConnection, wallet, baseMint, NATIVE_MINT, POOL_ID, undefined)
-      let sellTx = await makeSellPumpfunTokenTx(wallet, baseMint)
+      let sellTx = await (makeSellPumpfunTokenTx as any)(wallet, baseMint, sellAmount)
 
       if (sellTx == null) {
         console.log(`Error getting buy transaction`)
@@ -700,24 +430,25 @@ const checkMissing = () => {
 }
 
 type WalletRecord = {
-  kp: Keypair;
-  buyAmount?: number;
+  privateKey: string;
+  pubkey: string;
 };
 
- async function runVolumeBot(data: WalletRecord[], baseMint: PublicKey) {
+export async function runVolumeBot(data: WalletRecord[], baseMint: PublicKey) {
+  console.log("🚀 ~ runVolumeBot ~ data:", data)
   console.log(`[VOLUME] Starting with ${data.length} wallets`);
   while (true) {
     // for (const walletRec of wallets) {
-      // const kp = Keypair.fromSecretKey(base58.decode(walletRec.privateKey));
-      try {
-        console.log("---- New round of distribution ---- \n")
+    // const kp = Keypair.fromSecretKey(base58.decode(walletRec.privateKey));
+    try {
+      console.log("---- New round of distribution ---- \n")
 
       // let data: {
       //   kp: Keypair;
       //   buyAmount: number;
       // }[] | null = null
 
-      
+
       if (data == null || data.length == 0) {
         console.log("Distribution failed")
         await sleep(30000)
@@ -725,7 +456,8 @@ type WalletRecord = {
       }
       const interval = Math.floor((DISTRIBUTE_INTERVAL_MIN + Math.random() * (DISTRIBUTE_INTERVAL_MAX - DISTRIBUTE_INTERVAL_MIN)) * 1000)
 
-      data.map(async ({ kp }, n) => {
+      data.map(async ({ privateKey }, n) => {
+        let kp = Keypair.fromSecretKey(base58.decode(privateKey))
         // test case
         totalProcesses.add(kp.publicKey.toBase58())
 
@@ -735,10 +467,11 @@ type WalletRecord = {
         const BUY_WAIT_INTERVAL = Math.round(Math.random() * (BUY_INTERVAL_MAX - BUY_INTERVAL_MIN) + BUY_INTERVAL_MIN)
         const SELL_WAIT_INTERVAL = Math.round(Math.random() * (SELL_INTERVAL_MAX - SELL_INTERVAL_MIN) + SELL_INTERVAL_MIN)
         const solBalance = await solanaConnection.getBalance(srcKp.publicKey)
-
+        
         let buyAmountInPercent = Number((Math.random() * (BUY_UPPER_PERCENT - BUY_LOWER_PERCENT) + BUY_LOWER_PERCENT).toFixed(3))
-
+        
         if (solBalance < 5 * 10 ** 6) {
+          console.log("🚀 ~ runVolumeBot ~ solBalance:", solBalance)
           console.log("Sol balance is not enough in one of wallets")
           return
         }
@@ -879,10 +612,10 @@ type WalletRecord = {
 
       await sleep(interval)
       checkMissing()
-      } catch (err) {
-        console.error("[VOLUME] Wallet error", err);
-      }
-      await sleep(1000); // stagger between wallets
+    } catch (err) {
+      console.error("[VOLUME] Wallet error", err);
+    }
+    await sleep(1000); // stagger between wallets
     // }
     await sleep(5000); // wait before next round
   }
@@ -893,7 +626,7 @@ export async function runMarketMakerBot(wallets: WalletRecord[], totalTimeMinute
   console.log(`[MARKET MAKER] Starting with ${wallets.length} wallets`);
 
   // Calculate the total number of cycles based on totalTimeMinutes (one cycle per second for simplicity)
-  const totalCycles = totalTimeMinutes * 60; 
+  const totalCycles = totalTimeMinutes * 60;
 
   let cycleCount = 0;
   while (cycleCount < totalCycles) {
@@ -916,22 +649,23 @@ export async function runMarketMakerBot(wallets: WalletRecord[], totalTimeMinute
     }
 
     // Calculate the amount to be bought per wallet based on percentages
-    const totalBuyAmountForThisCycle = calculateCycleBuyAmount(selectedWallets, percentages);
+    const totalBuyAmountForThisCycle = await calculateCycleBuyAmount(selectedWallets, percentages);
 
     // Loop through each selected wallet and perform buy operation
     for (let i = 0; i < activeWalletsCount; i++) {
       const walletRec = selectedWallets[i];
       const buyAmount = totalBuyAmountForThisCycle[i];
+      const kp = Keypair.fromSecretKey(base58.decode(walletRec.privateKey))
 
       try {
         console.log(`[MARKET MAKER] Wallet ${i + 1} buying ${buyAmount} units`);
 
-        await buy(walletRec.kp, baseMint, buyAmount )
-
-        // Perform the actual buy operation here (e.g., calling the buy method)
-        // Example:
-        // await buyOperation(walletRec.kp, buyAmount);
-
+        let result = await buy(kp, baseMint, buyAmount)
+        if (result) {
+          console.log(`[MARKET MAKER] Wallet ${i + 1} bought ${buyAmount} units`);
+        } else {
+          console.log(`[MARKET MAKER] Wallet ${i + 1} failed to buy ${buyAmount} units`);
+        }
       } catch (err) {
         console.error("[MARKET MAKER] Wallet error", err);
       }
@@ -972,90 +706,116 @@ function generateRandomPercentages(walletsCount: number): number[] {
 }
 
 // Helper function to calculate how much to buy for each wallet in this cycle
-function calculateCycleBuyAmount(wallets: WalletRecord[], percentages: number[]): number[] {
-  const amounts: any = [];
+async function calculateCycleBuyAmount(wallets: WalletRecord[], percentages: number[]): Promise<number[]> {
+  const amounts: number[] = [];
   let totalAmount = 0;
 
-  // Calculate the total available amount to be bought from all selected wallets
-  wallets.forEach(wallet => {
-    totalAmount += wallet.buyAmount ?? 0; // Assuming wallet.balance gives the available token amount
-  });
+  // Get all balances first (in parallel)
+  const balances = await Promise.all(
+    wallets.map(wallet => solanaConnection.getBalance(new PublicKey(wallet.pubkey)))
+  );
 
-  // Now calculate the buy amount for each wallet based on the randomly generated percentages
-  wallets.forEach((wallet, index) => {
-    const buyAmount = (wallet.buyAmount ?? 0 * (percentages[index] / 100)); // Calculate percentage of wallet balance
+  // Calculate total balance
+  totalAmount = balances.reduce((sum, balance) => sum + (balance ?? 0), 0);
+
+  // Calculate buy amount for each wallet based on percentages
+  for (let i = 0; i < wallets.length; i++) {
+    const balance = balances[i] ?? 0;
+    const buyAmount = balance * (percentages[i] / 100);
     amounts.push(buyAmount);
-  });
+  }
 
   return amounts;
 }
+
 
 // Big Trade Bot - with dynamic buy/sell wallet selection and random differences
 export async function runBigTradeBot(wallets: WalletRecord[], totalTimeMinutes: number) {
   console.log(`[BIG TRADE] Starting with ${wallets.length} wallets`);
 
   // Calculate total number of cycles for the given time period
-  const totalCycles = totalTimeMinutes * 60; // Number of cycles per minute
+  const totalCycles = Math.max(1, Math.floor(totalTimeMinutes * 2)); // Reduced cycles for better control
   let cycleCount = 0;
 
   // Start with all wallets in buyAvailableWalletList (no wallets have been sold yet)
   let buyAvailableWalletList = [...wallets];
   let sellAvailableWalletList: WalletRecord[] = []; // Initially no wallets are available to sell
 
+  console.log(`[BIG TRADE] Total cycles planned: ${totalCycles}`);
+
   while (cycleCount < totalCycles) {
     cycleCount++;
 
-    // If there are no wallets left to buy, use the remaining wallets for the final buy
+    console.log(`[BIG TRADE] Cycle ${cycleCount}/${totalCycles} - Buy available: ${buyAvailableWalletList.length}, Sell available: ${sellAvailableWalletList.length}`);
+
+    // If there are no wallets left to buy, break the loop
     if (buyAvailableWalletList.length === 0) {
-      // All wallets are bought, no need to continue
       console.log("[BIG TRADE] No wallets left to buy. Finalizing.");
       break;
     }
 
-    // Randomize the number of wallets to buy from and sell to, ensuring a big difference
-    const walletsToBuyCount = Math.floor(Math.random() * (buyAvailableWalletList.length / 2)) + 1; // Random number between 1 and buyAvailableWalletList.length / 2
-    const walletsToSellCount = Math.floor(Math.random() * (sellAvailableWalletList.length / 2)) + 1; // Random number between 1 and sellAvailableWalletList.length / 2
+    // Determine wallets to buy (always buy at least 1, up to available wallets)
+    const maxBuyWallets = Math.min(buyAvailableWalletList.length, Math.floor(wallets.length * 0.3) + 1); // Max 30% of total wallets per cycle
+    const walletsToBuyCount = Math.floor(Math.random() * maxBuyWallets) + 1;
+    
+    // Determine wallets to sell (only if we have wallets available to sell)
+    let walletsToSellCount = 0;
+    if (sellAvailableWalletList.length > 0) {
+      const maxSellWallets = Math.min(sellAvailableWalletList.length, Math.floor(wallets.length * 0.2) + 1); // Max 20% of total wallets per cycle
+      walletsToSellCount = Math.floor(Math.random() * maxSellWallets) + 1;
+    }
 
-    // Ensure that there are enough wallets to buy and sell
-    if (walletsToBuyCount <= walletsToSellCount) {
-      continue; // Skip if the buy wallets are less than or equal to sell wallets
+    console.log(`🚀 ~ runBigTradeBot ~ walletsToBuyCount: ${walletsToBuyCount}`);
+    console.log(`🚀 ~ runBigTradeBot ~ walletsToSellCount: ${walletsToSellCount}`);
+
+    // Ensure we have enough wallets to buy
+    if (walletsToBuyCount > buyAvailableWalletList.length) {
+      console.log("[BIG TRADE] Not enough wallets to buy, skipping cycle");
+      continue;
     }
 
     // Randomly select wallets for buy and sell operations
     const buyWallets = selectRandomWallets(buyAvailableWalletList, walletsToBuyCount);
-    const sellWallets = selectRandomWallets(sellAvailableWalletList, walletsToSellCount);
+    const sellWallets = sellAvailableWalletList.length > 0 ? selectRandomWallets(sellAvailableWalletList, walletsToSellCount) : [];
 
-    // Perform the big buy and sell operations
+    console.log(`🚀 ~ runBigTradeBot ~ buyWallets: ${buyWallets.length} wallets`);
+    console.log(`🚀 ~ runBigTradeBot ~ sellWallets: ${sellWallets.length} wallets`);
+
+    // Perform the big buy operations
     for (const walletRec of buyWallets) {
       try {
-        // Get the available buy amount (if not defined, assume full balance)
-        const buyAmount = walletRec.buyAmount || 0; // If buyAmount is undefined, assume the full balance
+        const balance = await solanaConnection.getBalance(new PublicKey(walletRec.pubkey));
+        const buyAmount = balance || 0;
         await performBigBuy(walletRec); // 100% buy amount
-        console.log(`[BIG BUY] Wallet ${walletRec.kp.publicKey} bought ${buyAmount} tokens.`);
+        console.log(`[BIG BUY] Wallet ${walletRec.pubkey} bought tokens with ${buyAmount} SOL.`);
 
         // Once a wallet has been bought, it becomes available to sell in future cycles
         sellAvailableWalletList.push(walletRec);
       } catch (err) {
-        console.error("[BIG TRADE] Wallet error during buy", err);
+        console.error(`[BIG TRADE] Wallet ${walletRec.pubkey} error during buy:`, err);
       }
-      await sleep(2000); // Random pause between buy actions
+      await sleep(2000); // Pause between buy actions
     }
 
+    // Perform the big sell operations
     for (const walletRec of sellWallets) {
       try {
-        // Get the available sell amount (assuming full balance for selling)
         await performBigSell(walletRec); // 100% sell amount
-        console.log(`[BIG SELL] Wallet ${walletRec.kp.publicKey} sold tokens.`);
+        console.log(`[BIG SELL] Wallet ${walletRec.pubkey} sold tokens.`);
+        
+        // Remove sold wallet from sell list (it can be bought again in future cycles)
+        sellAvailableWalletList = sellAvailableWalletList.filter(wallet => wallet.pubkey !== walletRec.pubkey);
+        buyAvailableWalletList.push(walletRec); // Make it available for buying again
       } catch (err) {
-        console.error("[BIG TRADE] Wallet error during sell", err);
+        console.error(`[BIG TRADE] Wallet ${walletRec.pubkey} error during sell:`, err);
       }
-      await sleep(2000); // Random pause between sell actions
+      await sleep(2000); // Pause between sell actions
     }
 
-    // Remove the wallets that were bought from the buy list (they are now in the sell list)
+    // Remove the wallets that were bought from the buy list
     buyAvailableWalletList = buyAvailableWalletList.filter(wallet => !buyWallets.includes(wallet));
 
-    // If all wallets have been used (bought and sold), stop the process
+    // If all wallets have been used and no more operations possible, break
     if (buyAvailableWalletList.length === 0 && sellAvailableWalletList.length === 0) {
       console.log("[BIG TRADE] All wallets have been used.");
       break;
@@ -1064,7 +824,7 @@ export async function runBigTradeBot(wallets: WalletRecord[], totalTimeMinutes: 
     // Random cycle delay between actions
     const cycleDelay = Math.floor(Math.random() * 15000) + 5000; // Random delay between 5-20 seconds
     console.log(`[BIG TRADE] Waiting for ${cycleDelay / 1000} seconds before next cycle...`);
-    await sleep(cycleDelay); // Sleep before next big trade cycle
+    await sleep(cycleDelay);
     console.log(`[BIG TRADE] Cycle ${cycleCount}/${totalCycles} complete.`);
   }
 
@@ -1073,16 +833,13 @@ export async function runBigTradeBot(wallets: WalletRecord[], totalTimeMinutes: 
     console.log("[BIG TRADE] Finalizing: Buying from all remaining wallets.");
     for (const walletRec of buyAvailableWalletList) {
       try {
-        const buyAmount = walletRec.buyAmount || 0;
+        const buyAmount = await solanaConnection.getBalance(new PublicKey(walletRec.pubkey)) || 0;
         await performBigBuy(walletRec); // 100% buy amount
-        console.log(`[BIG BUY] Wallet ${walletRec.kp.publicKey} bought ${buyAmount} tokens.`);
-
-        // Once a wallet has been bought, it becomes available to sell in future cycles
-        sellAvailableWalletList.push(walletRec);
+        console.log(`[BIG BUY] Wallet ${walletRec.pubkey} bought tokens with ${buyAmount} SOL.`);
       } catch (err) {
-        console.error("[BIG TRADE] Wallet error during final buy", err);
+        console.error(`[BIG TRADE] Wallet ${walletRec.pubkey} error during final buy:`, err);
       }
-      await sleep(2000); // Random pause between buy actions
+      await sleep(2000); // Pause between buy actions
     }
   }
 
@@ -1092,17 +849,24 @@ export async function runBigTradeBot(wallets: WalletRecord[], totalTimeMinutes: 
 
 // Simulate a "big buy" operation (buyAmount is in the WalletRecord)
 async function performBigBuy(walletRec: WalletRecord) {
-  console.log(`[BIG BUY] Wallet ${walletRec.kp.publicKey} is buying tokens`);
+  console.log(`[BIG BUY] Wallet ${walletRec.pubkey} is buying tokens`);
 
-  let balanceLamports = await solanaConnection.getBalance(walletRec.kp.publicKey)
+  let balanceLamports = await solanaConnection.getBalance(new PublicKey(walletRec.pubkey))
 
   const balanceSol = balanceLamports / 1e9;
 
   const tokenPrice = await getTokenPrice(baseMint.toBase58())
 
-  const buyAmount = (balanceSol - 0.05) / tokenPrice
+  const buyAmount = (balanceSol - 0.005) / tokenPrice
 
-  let result  = await buy(walletRec.kp, baseMint, buyAmount)
+  const kp = Keypair.fromSecretKey(base58.decode(walletRec.privateKey))
+  let result = await buy(kp, baseMint, buyAmount)
+
+  if (result) {
+    console.log(`[BIG BUY] Wallet ${walletRec.pubkey} bought ${buyAmount} tokens.`);
+  } else {
+    console.log(`[BIG BUY] Wallet ${walletRec.pubkey} failed to buy ${buyAmount} tokens.`);
+  }
 
   // Perform the actual buy operation (place your logic here)
   await sleep(500); // Simulate the time taken for the buy operation
@@ -1110,9 +874,16 @@ async function performBigBuy(walletRec: WalletRecord) {
 
 // Simulate a "big sell" operation (buyAmount is in the WalletRecord)
 async function performBigSell(walletRec: WalletRecord) {
-  console.log(`[BIG SELL] Wallet ${walletRec.kp.publicKey} is selling tokens`);
+  console.log(`[BIG SELL] Wallet ${walletRec.pubkey} is selling tokens`);
 
-  let result  = await sell(baseMint, walletRec.kp)
+  const kp = Keypair.fromSecretKey(base58.decode(walletRec.privateKey))
+  let result = await sell(baseMint, kp)
+  
+  if (result) {
+    console.log(`[BIG SELL] Wallet ${walletRec.pubkey} sold tokens.`);
+  } else {
+    console.log(`[BIG SELL] Wallet ${walletRec.pubkey} failed to sell tokens.`);
+  }
   // Perform the actual sell operation (place your logic here)
   await sleep(2000); // Simulate the time taken for the sell operation
 }
@@ -1132,4 +903,70 @@ function selectRandomWallets(wallets: WalletRecord[], count: number): WalletReco
 }
 
 
-main()
+// Main function that orchestrates all bot operations
+export async function main() {
+  console.log('🚀 Starting Pumpfun Volume Market Maker Bot...');
+  
+  try {
+    // This function will be called from CLI bot
+    // The actual execution logic is in cli-bot.ts
+    console.log('📝 Please run: npm run start or node cli-bot.js');
+    console.log('💡 Use the CLI interface for interactive configuration.');
+  } catch (error) {
+    console.error('❌ Main function error:', error);
+    throw error;
+  }
+}
+
+// Export the main function for CLI usage
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+export const sellPumpswap = async (baseMint: PublicKey, wallet: Keypair, sellPercent: number) => {
+  try {
+    const data: Data[] = readJson("market_maker_data.json");
+    if (data.length == 0) {
+      await sleep(1000)
+      return null
+    }
+
+    const tokenAta = await getAssociatedTokenAddress(baseMint, wallet.publicKey)
+    const tokenBalInfo = await solanaConnection.getTokenAccountBalance(tokenAta)
+    if (!tokenBalInfo) {
+      console.log("Balance incorrect")
+      return null
+    }
+
+    try {
+      let sellTx = await makeSellPumpswapTokenTxMarketMaker(wallet, baseMint, sellPercent);
+
+      if (sellTx == null) {
+        console.log(`Error getting buy transaction`)
+        return null
+      }
+
+      // console.log("simulateTransaction ==> ", await solanaConnection.simulateTransaction(sellTx))
+      let txSig
+      if (JITO_MODE) {
+        txSig = await executeJitoTx([sellTx], mainKp, jitoCommitment)
+      } else {
+        const latestBlockhash = await solanaConnection.getLatestBlockhash()
+        txSig = await execute(sellTx, latestBlockhash, false)
+      }
+      if (txSig) {
+        const tokenSellTx = txSig ? `https://solscan.io/tx/${txSig}` : ''
+        console.log("Success in sell transaction: ", tokenSellTx)
+        return tokenSellTx
+      } else {
+        return null
+      }
+    } catch (error) {
+      await sleep(1000)
+      console.log("Sell transaction error", error);
+      return null
+    }
+  } catch (error) {
+    return null
+  }
+}

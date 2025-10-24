@@ -6,15 +6,15 @@ import base58 from "bs58"
 import { readJson, saveNewFile, sleep } from "./utils"
 import { getSellTxWithJupiter } from "./utils/swapOnlyAmm";
 import { execute } from "./executor/legacy";
-import { GATHER_ADDRESS, GATHER_TO_OTHER_ADDRESS, POOL_ID, PRIVATE_KEY, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT } from "./constants";
+import { GATHER_ADDRESS, GATHER_TO_OTHER_ADDRESS, PRIVATE_KEY, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT } from "./constants";
 import { getSellTx } from "./utils/swapRaySdk";
 import { makeSellPumpfunTokenTx } from "./utils/pumpfun";
 
 const connection = new Connection(RPC_ENDPOINT, { wsEndpoint: RPC_WEBSOCKET_ENDPOINT, commitment: "confirmed" });
 const mainKp = Keypair.fromSecretKey(base58.decode(PRIVATE_KEY))
 
-const main = async () => {
-  const walletsData = readJson()
+export const gather = async () => {
+  const walletsData = readJson("wallet.json")
 
   const wallets = walletsData.map(({ privateKey }) => Keypair.fromSecretKey(base58.decode(privateKey)))
   wallets.map(async (kp, i) => {
@@ -151,4 +151,4 @@ const main = async () => {
   })
 }
 
-main()
+// gather()

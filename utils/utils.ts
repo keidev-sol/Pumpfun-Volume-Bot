@@ -1,8 +1,15 @@
 import dotenv from 'dotenv';
 import fs from 'fs';
-import { BIRDEYE_KEY } from '../constants';
+import { BIRDEYE_KEY, BONDING_CURVE_SEED, PumpswapProgram } from '../constants';
+import { Commitment, PublicKey } from '@solana/web3.js';
+import { solanaConnection } from '..';
+import { BondingCurveAccount } from './bondingCurveAccount';
+import { PumpfunProgram } from './pumpfun';
+import { Metaplex } from "@metaplex-foundation/js";
+import { BN } from 'bn.js';
+import { NATIVE_MINT } from '@solana/spl-token';
 
-dotenv.config();
+  dotenv.config();
 
 export const retrieveEnvVariable = (variableName: string) => {
   const variable = process.env[variableName] || '';
@@ -164,5 +171,47 @@ export const getTokenPrice = async(address: string): Promise<number> => {
   } catch (error) {
       console.error("Error fetching token price:", error);
       return 0; // Return 0 on any other error
+  }
+}
+
+export const getBondingCurveAccount = async (
+  mint: PublicKey,
+  commitment: Commitment = "processed"
+) => {
+  const tokenAccount = await solanaConnection.getAccountInfo(
+    getBondingCurvePDA(mint),
+    commitment
+  );
+  if (!tokenAccount) {
+    return null;
+  }
+  return BondingCurveAccount.fromBuffer(tokenAccount!.data);
+}
+
+export const getBondingCurvePDA = (mint: PublicKey) => {
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from(BONDING_CURVE_SEED), mint.toBuffer()],
+    PumpfunProgram.programId
+  )[0];
+}
+
+export const getPumpswapPoolId = async (mint: PublicKey) => {
+  const creatorAddress = await getTokenSymbol(mint);
+  const [pool] = PublicKey.findProgramAddressSync(
+      [Buffer.from("pool"), new BN(0).toArrayLike(Buffer, "le", 2), new PublicKey(creatorAddress).toBuffer(), mint.toBuffer(), NATIVE_MINT.toBuffer()],
+      PumpswapProgram.programId
+  );
+  console.log("getPumpswapPoolId pool address ==> ", pool);
+  return pool.toBase58();
+}
+
+export const getTokenSymbol = async (mintAddress: PublicKey) => {
+  const metaplex = new Metaplex(solanaConnection);
+  try {
+    const nft = await metaplex.nfts().findByMint({ mintAddress });
+    return nft.creators[0].address.toBase58() || '';
+  } catch (error) {
+    console.error(':x: Error fetching token symbol:', error);
+    return '';
   }
 }

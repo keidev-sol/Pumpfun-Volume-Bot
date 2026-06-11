@@ -2,6 +2,7 @@ import {
   createCloseAccountInstruction,
   getAssociatedTokenAddress,
   getAssociatedTokenAddressSync,
+  TOKEN_PROGRAM_ID,
 } from '@solana/spl-token'
 import {
   Keypair,
@@ -342,23 +343,26 @@ export const sell = async (baseMint: PublicKey, wallet: Keypair, sellAmount?: nu
       return null
     }
 
-    const tokenAta = await getAssociatedTokenAddress(baseMint, wallet.publicKey)
-    const tokenBalInfo = await solanaConnection.getTokenAccountBalance(tokenAta)
+    // Pump.fun mints can be legacy SPL or Token-2022 — derive the ATA under the
+    // mint's actual owning program, otherwise the balance lookup fails.
+    const mintInfo = await solanaConnection.getAccountInfo(baseMint)
+    const tokenProgram = mintInfo?.owner ?? TOKEN_PROGRAM_ID
+    const tokenAta = getAssociatedTokenAddressSync(baseMint, wallet.publicKey, true, tokenProgram)
+    const tokenBalInfo = await solanaConnection.getTokenAccountBalance(tokenAta).catch(() => null)
     if (!tokenBalInfo) {
-      console.log("Balance incorrect")
+      console.log("No token balance to sell")
       return null
     }
     const tokenBalance = tokenBalInfo.value.amount
-
-    let amount = sellAmount ? sellAmount : tokenBalance
+    if (!Number(tokenBalance)) {
+      return null
+    }
 
     try {
-      // let sellTx = await getSellTxWithJupiter(wallet, baseMint, tokenBalance)
-      // let sellTx = await getSellTx(solanaConnection, wallet, baseMint, NATIVE_MINT, POOL_ID, undefined)
-      let sellTx = await (makeSellPumpfunTokenTx as any)(wallet, baseMint, sellAmount)
+      let sellTx = await makeSellPumpfunTokenTx(wallet, baseMint, sellAmount)
 
       if (sellTx == null) {
-        console.log(`Error getting buy transaction`)
+        console.log(`Error getting sell transaction`)
         return null
       }
 

@@ -1,10 +1,11 @@
 {
-  "name": "volume-bot",
+  "name": "pumpfun-volume-bot",
   "scripts": {
     "tsc": "tsc --noEmit",
     "start": "ts-node cli-bot.ts",
     "bot": "ts-node cli-bot.ts",
     "gather": "ts-node gather.ts",
+    "simulate": "ts-node simulate.ts",
     "test": "ts-node test.ts",
     "gather_without_sell": "ts-node gather_without_sell.ts"
   },
@@ -13,6 +14,7 @@
     "@metaplex-foundation/js": "^0.20.1",
     "@metaplex-foundation/mpl-token-metadata": "^3.2.1",
     "@metaplex-foundation/umi": "^0.9.1",
+    "@pump-fun/pump-sdk": "^1.36.0",
     "@raydium-io/raydium-sdk": "^1.3.1-beta.47",
     "@solana/spl-token": "^0.4.0",
     "@solana/web3.js": "^1.89.1",

@@ -1,13 +1,14 @@
-import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddress, getAssociatedTokenAddressSync, NATIVE_MINT, TOKEN_PROGRAM_ID } from "@solana/spl-token"
-import { ComputeBudgetProgram, Connection, Keypair, PublicKey, TransactionMessage, VersionedTransaction } from "@solana/web3.js"
+import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddress, getAssociatedTokenAddressSync, getMint, NATIVE_MINT, TOKEN_PROGRAM_ID } from "@solana/spl-token"
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js"
 import PumpfunIDL from '../contract/pumpfun-idl.json'
 import { Pump } from '../contract/pumpfun-types'
 import { AnchorProvider, Program } from "@coral-xyz/anchor";
 import { BN } from "bn.js";
-import { FEE_RECIPIENT, Target_MINT, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, GLOBAL_CONFIG, PumpswapProgram } from "../constants";
+import { FEE_RECIPIENT, Target_MINT, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, GLOBAL_CONFIG, PumpswapProgram, SLIPPAGE, FEE_LEVEL } from "../constants";
 import NodeWallet from "@coral-xyz/anchor/dist/cjs/nodewallet";
 import { BondingCurveAccount } from "./bondingCurveAccount";
 import { getPumpswapPoolId } from "./utils";
+import { OnlinePumpSdk, PumpSdk, getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount } from "@pump-fun/pump-sdk";
 
 const solanaConnection = new Connection(RPC_ENDPOINT, {
   wsEndpoint: RPC_WEBSOCKET_ENDPOINT, commitment: "confirmed"
@@ -15,82 +16,139 @@ const solanaConnection = new Connection(RPC_ENDPOINT, {
 const provider = new AnchorProvider(solanaConnection, new NodeWallet(Keypair.generate()))
 export const PumpfunProgram = new Program<Pump>(PumpfunIDL as Pump, provider);
 
+// Official Pump.fun SDK — keeps buy/sell in sync with the live program
+// (Token-2022 mints, buyback fee recipients, mayhem mode, etc.).
+const onlinePumpSdk = new OnlinePumpSdk(solanaConnection);
+const pumpSdk = new PumpSdk();
+
+// Pump.fun now issues both legacy SPL and Token-2022 mints. The correct token
+// program is whatever owns the mint account; using the wrong one makes every
+// associated-token-account / trade instruction fail with IncorrectProgramId.
+const getMintTokenProgram = async (mint: PublicKey): Promise<PublicKey> => {
+  const info = await solanaConnection.getAccountInfo(mint);
+  return info?.owner ?? TOKEN_PROGRAM_ID;
+};
+
+// Slippage is configured as a percent (env SLIPPAGE). Fall back to a tolerant
+// default so volume trades reliably land.
+const slippagePercent = Number.isFinite(SLIPPAGE) && SLIPPAGE > 0 ? SLIPPAGE : 50;
+
+const buildSignedTx = async (
+  signer: Keypair,
+  instructions: TransactionInstruction[]
+): Promise<VersionedTransaction> => {
+  const priorityIxs = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: Math.max(1, Math.floor((Number.isFinite(FEE_LEVEL) ? FEE_LEVEL : 10) * 20_000)),
+    }),
+  ];
+  const blockhash = (await solanaConnection.getLatestBlockhash()).blockhash;
+  const msg = new TransactionMessage({
+    payerKey: signer.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [...priorityIxs, ...instructions],
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(msg);
+  tx.sign([signer]);
+  return tx;
+};
+
+// Build a signed Pump.fun bonding-curve BUY transaction.
+// `amount` is the amount of SOL to spend, in lamports.
 export const makeBuyPumpfunTokenTx = async (mainKp: Keypair, mint: PublicKey, amount: number) => {
   try {
-    const bondingCurveAccount = await getBondingCurveAccount(solanaConnection, new PublicKey(Target_MINT));
-    if(!bondingCurveAccount)
-      return
-    const buyAmount = bondingCurveAccount.getBuyPrice(BigInt(Math.floor(amount))) / BigInt(2);
-    const associatedUser = getAssociatedTokenAddressSync(mint, mainKp.publicKey)
-    const buyIx = await PumpfunProgram.methods
-      .buy(new BN(buyAmount.toString()), new BN(Math.floor(amount)), { "0": true })
-      .accounts({
-        associatedUser,
-        feeRecipient: FEE_RECIPIENT,
-        mint,
-        user: mainKp.publicKey
-      })
-      .instruction()
+    const tokenProgram = await getMintTokenProgram(mint);
+    const solAmount = new BN(Math.floor(amount));
 
-    const blockhash = (await solanaConnection.getLatestBlockhash()).blockhash
+    const [global, feeConfig, buyState, mintAccount] = await Promise.all([
+      onlinePumpSdk.fetchGlobal(),
+      onlinePumpSdk.fetchFeeConfig(),
+      onlinePumpSdk.fetchBuyState(mint, mainKp.publicKey, tokenProgram),
+      getMint(solanaConnection, mint, "confirmed", tokenProgram),
+    ]);
 
-    const msg = new TransactionMessage({
-      instructions: [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200_000 }),
-        createAssociatedTokenAccountIdempotentInstruction(mainKp.publicKey, associatedUser, mainKp.publicKey, mint),
-        buyIx
-      ],
-      payerKey: mainKp.publicKey,
-      recentBlockhash: blockhash
-    }).compileToV0Message()
+    // Expected token amount out for the given SOL input (used as the order size;
+    // `slippage` protects the actual cost).
+    const tokenAmount = getBuyTokenAmountFromSolAmount({
+      global,
+      feeConfig,
+      mintSupply: new BN(mintAccount.supply.toString()),
+      bondingCurve: buyState.bondingCurve,
+      amount: solAmount,
+      quoteMint: NATIVE_MINT,
+    });
+    if (tokenAmount.lten(0)) {
+      console.log("Buy amount too small, skipping");
+      return null;
+    }
 
-    const buyVTx = new VersionedTransaction(msg)
-    buyVTx.sign([mainKp])
+    const instructions = await pumpSdk.buyInstructions({
+      global,
+      bondingCurveAccountInfo: buyState.bondingCurveAccountInfo,
+      bondingCurve: buyState.bondingCurve,
+      associatedUserAccountInfo: buyState.associatedUserAccountInfo,
+      mint,
+      user: mainKp.publicKey,
+      amount: tokenAmount,
+      solAmount,
+      slippage: slippagePercent,
+      tokenProgram,
+    });
 
-    // console.log("buy pumpfun tx simulate ==>", await solanaConnection.simulateTransaction(buyVTx, { sigVerify: true }))
-    return buyVTx
+    return await buildSignedTx(mainKp, instructions);
   } catch (error) {
     console.log("Error while making buy transaction in pumpfun", error)
     return null
   }
 }
 
+// Build a signed Pump.fun bonding-curve SELL transaction.
+// `sellAmount` is the raw token amount to sell; when omitted the whole balance is sold.
 export const makeSellPumpfunTokenTx = async (mainKp: Keypair, mint: PublicKey, sellAmount?: number) => {
   try {
-    const associatedUser = getAssociatedTokenAddressSync(mint, mainKp.publicKey)
-    const balance = await solanaConnection.getTokenAccountBalance(associatedUser)
+    const tokenProgram = await getMintTokenProgram(mint);
+    const associatedUser = getAssociatedTokenAddressSync(mint, mainKp.publicKey, true, tokenProgram);
+    const balance = await solanaConnection.getTokenAccountBalance(associatedUser);
 
-    const sellIx = await PumpfunProgram.methods
-      .sell(new BN(sellAmount ? Math.floor(sellAmount) : balance.value.amount), new BN(0))
-      .accounts({
-        associatedUser,
-        feeRecipient: FEE_RECIPIENT,
-        mint,
-        user: mainKp.publicKey
-      })
-      .instruction()
+    const amount = new BN(sellAmount ? Math.floor(sellAmount) : balance.value.amount);
+    if (amount.lten(0)) {
+      console.log("Nothing to sell (zero token balance)");
+      return null;
+    }
 
-    const blockhash = (await solanaConnection.getLatestBlockhash()).blockhash
+    const [global, feeConfig, sellState, mintAccount] = await Promise.all([
+      onlinePumpSdk.fetchGlobal(),
+      onlinePumpSdk.fetchFeeConfig(),
+      onlinePumpSdk.fetchSellState(mint, mainKp.publicKey, tokenProgram),
+      getMint(solanaConnection, mint, "confirmed", tokenProgram),
+    ]);
 
-    const msg = new TransactionMessage({
-      instructions: [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100_000 }),
-        createAssociatedTokenAccountIdempotentInstruction(mainKp.publicKey, associatedUser, mainKp.publicKey, mint),
-        sellIx
-      ],
-      payerKey: mainKp.publicKey,
-      recentBlockhash: blockhash
-    }).compileToV0Message()
+    // Expected SOL out for the token amount; `slippage` enforces the minimum.
+    const solAmount = getSellSolAmountFromTokenAmount({
+      global,
+      feeConfig,
+      mintSupply: new BN(mintAccount.supply.toString()),
+      bondingCurve: sellState.bondingCurve,
+      amount,
+    });
 
-    const sellVTx = new VersionedTransaction(msg)
-    sellVTx.sign([mainKp])
+    const instructions = await pumpSdk.sellInstructions({
+      global,
+      bondingCurveAccountInfo: sellState.bondingCurveAccountInfo,
+      bondingCurve: sellState.bondingCurve,
+      mint,
+      user: mainKp.publicKey,
+      amount,
+      solAmount,
+      slippage: slippagePercent,
+      tokenProgram,
+      mayhemMode: Boolean((sellState.bondingCurve as any).isMayhemMode),
+    });
 
-    // console.log("sell pumpfun tx simulate ==>", await solanaConnection.simulateTransaction(sellVTx, { sigVerify: true }))
-    return sellVTx
+    return await buildSignedTx(mainKp, instructions);
   } catch (error) {
-    console.log("Error while making sell transaction in pumpfun")
+    console.log("Error while making sell transaction in pumpfun", error)
     return null
   }
 }
